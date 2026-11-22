@@ -22,6 +22,7 @@ import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.theartist.music.R
+import com.theartist.music.model.RepeatMode
 import com.theartist.music.model.Track
 import com.theartist.music.model.accentColorForKey
 import com.theartist.music.service.MusicPlaybackService
@@ -72,9 +73,14 @@ class AndroidAudioPlayerController(
         ComponentName(appContext, MusicPlaybackService::class.java)
     )
     private val controllerFuture = MediaController.Builder(appContext, sessionToken).buildAsync()
+
     private var controller: MediaController? = null
-    private var pendingTrack: Track? = null
+    private var pendingQueue: Pair<List<Track>, Int>? = null
+    private var desiredShuffle: Boolean = false
+    private var desiredRepeat: RepeatMode = RepeatMode.ALL
     private var onCompleted: (() -> Unit)? = null
+    private var onTrackChanged: ((String) -> Unit)? = null
+    private var onPlayingStateChanged: ((Boolean) -> Unit)? = null
 
     init {
         controllerFuture.addListener(
@@ -82,16 +88,33 @@ class AndroidAudioPlayerController(
                 runCatching {
                     val ctrl = controllerFuture.get()
                     controller = ctrl
+                    applyModes(ctrl)
                     ctrl.addListener(object : Player.Listener {
+                        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                            val id = mediaItem?.mediaId ?: return
+                            onTrackChanged?.invoke(id)
+                        }
+
+                        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                            onPlayingStateChanged?.invoke(playWhenReady)
+                        }
+
+                        override fun onIsPlayingChanged(isPlaying: Boolean) {
+                            val active = isPlaying || (ctrl.playWhenReady && ctrl.playbackState == Player.STATE_BUFFERING)
+                            onPlayingStateChanged?.invoke(active)
+                        }
+
                         override fun onPlaybackStateChanged(playbackState: Int) {
                             if (playbackState == Player.STATE_ENDED) {
+                                onPlayingStateChanged?.invoke(false)
                                 onCompleted?.invoke()
                             }
                         }
                     })
-                    pendingTrack?.let { track ->
-                        pendingTrack = null
-                        startTrackOnController(ctrl, track)
+
+                    pendingQueue?.let { (tracks, startIndex) ->
+                        pendingQueue = null
+                        startQueueOnController(ctrl, tracks, startIndex)
                     }
                 }
             },
@@ -100,36 +123,100 @@ class AndroidAudioPlayerController(
     }
 
     override fun playTrack(track: Track) {
-        val ctrl = controller
-        if (ctrl == null) {
-            pendingTrack = track
-            return
-        }
-        startTrackOnController(ctrl, track)
+        setQueueAndPlay(listOf(track), 0)
     }
 
-    private fun startTrackOnController(ctrl: MediaController, track: Track) {
-        scope.launch {
-            val artBytes = withTimeoutOrNull(180L) {
-                scanner.loadArtworkBytes(track)
-            }
-            val metadataBuilder = MediaMetadata.Builder()
-                .setTitle(track.title)
-                .setArtist(track.artist)
-                .setAlbumTitle(track.album)
-            if (artBytes != null && artBytes.isNotEmpty()) {
-                metadataBuilder.setArtworkData(artBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
-            }
-            val mediaItem = MediaItem.Builder()
-                .setMediaId(track.id)
-                .setUri(Uri.parse(track.uri))
-                .setMediaMetadata(metadataBuilder.build())
-                .build()
+    override fun setQueueAndPlay(tracks: List<Track>, startIndex: Int) {
+        if (tracks.isEmpty()) return
+        val safeIdx = startIndex.coerceIn(0, tracks.lastIndex)
+        val ctrl = controller
+        if (ctrl == null) {
+            pendingQueue = tracks to safeIdx
+            return
+        }
+        startQueueOnController(ctrl, tracks, safeIdx)
+    }
 
-            ctrl.setMediaItem(mediaItem)
+    private fun startQueueOnController(
+        ctrl: MediaController,
+        tracks: List<Track>,
+        startIndex: Int
+    ) {
+        // Keep IPC payload safe (<1 MB Binder limit) with a 200-track window centered on startIndex
+        val windowRadius = 100
+        val fromIndex = (startIndex - windowRadius).coerceAtLeast(0)
+        val toIndex = (startIndex + windowRadius + 1).coerceAtMost(tracks.size)
+        val windowTracks = tracks.subList(fromIndex, toIndex)
+        val localStartIndex = startIndex - fromIndex
+        val activeTrack = windowTracks[localStartIndex]
+
+        scope.launch {
+            val activeArtBytes = withTimeoutOrNull(180L) {
+                scanner.loadArtworkBytes(activeTrack)
+            }
+
+            val mediaItems = windowTracks.mapIndexed { idx, track ->
+                val metadataBuilder = MediaMetadata.Builder()
+                    .setTitle(track.title)
+                    .setArtist(track.artist)
+                    .setAlbumTitle(track.album)
+
+                track.albumId?.let { albId ->
+                    val artUri = ContentUris.withAppendedId(ALBUM_ART_URI, albId)
+                    metadataBuilder.setArtworkUri(artUri)
+                }
+
+                if (idx == localStartIndex && activeArtBytes != null && activeArtBytes.isNotEmpty()) {
+                    metadataBuilder.setArtworkData(activeArtBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+                }
+
+                MediaItem.Builder()
+                    .setMediaId(track.id)
+                    .setUri(Uri.parse(track.uri))
+                    .setMediaMetadata(metadataBuilder.build())
+                    .build()
+            }
+
+            applyModes(ctrl)
+            ctrl.setMediaItems(mediaItems, localStartIndex, 0L)
             ctrl.prepare()
             ctrl.playWhenReady = true
         }
+    }
+
+    override fun skipNextNative(): Boolean {
+        val ctrl = controller ?: return false
+        if (ctrl.mediaItemCount == 0) return false
+        if (ctrl.hasNextMediaItem()) {
+            ctrl.seekToNextMediaItem()
+            ctrl.playWhenReady = true
+            return true
+        }
+        if (desiredRepeat == RepeatMode.ALL && ctrl.mediaItemCount > 0) {
+            ctrl.seekTo(0, 0L)
+            ctrl.playWhenReady = true
+            return true
+        }
+        return false
+    }
+
+    override fun skipPreviousNative(): Boolean {
+        val ctrl = controller ?: return false
+        if (ctrl.mediaItemCount == 0) return false
+        // ExoPlayer native seekToPrevious(): >3s restarts current track; <=3s jumps to previous track!
+        ctrl.seekToPrevious()
+        ctrl.playWhenReady = true
+        return true
+    }
+
+    override fun setShuffleEnabled(enabled: Boolean) {
+        desiredShuffle = enabled
+        controller?.shuffleModeEnabled = enabled
+    }
+
+    override fun setRepeatMode(mode: RepeatMode) {
+        desiredRepeat = mode
+        controller?.repeatMode = toExoRepeatMode(mode)
     }
 
     override fun pause() {
@@ -162,10 +249,33 @@ class AndroidAudioPlayerController(
         onCompleted = listener
     }
 
+    override fun setOnTrackChangedListener(listener: (String) -> Unit) {
+        onTrackChanged = listener
+    }
+
+    override fun setOnPlayingStateChangedListener(listener: (Boolean) -> Unit) {
+        onPlayingStateChanged = listener
+    }
+
     override fun release() {
         scope.cancel()
         MediaController.releaseFuture(controllerFuture)
         controller = null
+    }
+
+    private fun applyModes(ctrl: MediaController) {
+        ctrl.shuffleModeEnabled = desiredShuffle
+        ctrl.repeatMode = toExoRepeatMode(desiredRepeat)
+    }
+
+    private fun toExoRepeatMode(mode: RepeatMode): Int = when (mode) {
+        RepeatMode.OFF -> Player.REPEAT_MODE_OFF
+        RepeatMode.ALL -> Player.REPEAT_MODE_ALL
+        RepeatMode.ONE -> Player.REPEAT_MODE_ONE
+    }
+
+    companion object {
+        private val ALBUM_ART_URI: Uri = Uri.parse("content://media/external/audio/albumart")
     }
 }
 
@@ -213,6 +323,7 @@ class AndroidLocalMusicScanner(
             add(MediaStore.Audio.Media.TITLE)
             add(MediaStore.Audio.Media.ARTIST)
             add(MediaStore.Audio.Media.ALBUM)
+            add(MediaStore.Audio.Media.ALBUM_ID)
             add(MediaStore.Audio.Media.DURATION)
             add(MediaStore.Audio.Media.DATE_ADDED)
             add(MediaStore.Audio.Media.MIME_TYPE)
@@ -241,6 +352,7 @@ class AndroidLocalMusicScanner(
                 val titleCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
                 val artistCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
                 val albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
+                val albumIdCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM_ID)
                 val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
                 val dateAddedCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_ADDED)
                 val mimeCol = cursor.getColumnIndex(MediaStore.Audio.Media.MIME_TYPE)
@@ -263,6 +375,7 @@ class AndroidLocalMusicScanner(
                     val artist = if (rawArtist.isNullOrBlank() || rawArtist == "<unknown>") "Artiste inconnu" else rawArtist
                     val rawAlbum = cursor.getString(albumCol)
                     val album = if (rawAlbum.isNullOrBlank() || rawAlbum == "<unknown>") "Album inconnu" else rawAlbum
+                    val albumId = if (albumIdCol >= 0) cursor.getLong(albumIdCol) else null
                     val duration = cursor.getLong(durationCol).coerceAtLeast(0L)
                     val dateAddedSec = if (dateAddedCol >= 0) cursor.getLong(dateAddedCol) else 0L
                     val mime = if (mimeCol >= 0) cursor.getString(mimeCol) else null
@@ -286,6 +399,7 @@ class AndroidLocalMusicScanner(
                         folderName = folderName,
                         folderPath = displayFolderPath,
                         filePath = filePath,
+                        albumId = albumId,
                         durationMs = duration,
                         dateAddedSec = dateAddedSec,
                         uri = contentUri.toString(),

@@ -79,9 +79,36 @@ class MusicPlayerStateHolder(
                 onTrackCompleted()
             }
         }
+        audioController.setOnTrackChangedListener { mediaId ->
+            scope.launch {
+                onExternalTrackChanged(mediaId)
+            }
+        }
+        audioController.setOnPlayingStateChangedListener { playing ->
+            scope.launch {
+                _uiState.update { it.copy(isPlaying = playing) }
+            }
+        }
+        audioController.setRepeatMode(_uiState.value.repeatMode)
         startProgressLoop()
         if (initialPermissionGranted) {
             refreshLibrary()
+        }
+    }
+
+    private fun onExternalTrackChanged(mediaId: String) {
+        val state = _uiState.value
+        val newIndex = state.queue.indexOfFirst { it.id == mediaId }
+        if (newIndex < 0) return
+        val target = state.queue[newIndex]
+        loadLyricsForCurrentTrack(target)
+        _uiState.update {
+            it.copy(
+                currentQueueIndex = newIndex,
+                positionMs = 0L,
+                durationMs = target.durationMs,
+                recentIds = (listOf(target.id) + it.recentIds.filterNot { id -> id == target.id }).take(30)
+            )
         }
     }
 
@@ -195,7 +222,7 @@ class MusicPlayerStateHolder(
         val safeIndex = if (shuffle) 0 else startIndex.coerceIn(0, ordered.lastIndex)
         val target = ordered[safeIndex]
 
-        audioController.playTrack(target)
+        audioController.setQueueAndPlay(ordered, safeIndex)
         loadLyricsForCurrentTrack(target)
         _uiState.update { state ->
             state.copy(
@@ -214,7 +241,7 @@ class MusicPlayerStateHolder(
     fun playFromQueue(index: Int) {
         val state = _uiState.value
         val track = state.queue.getOrNull(index) ?: return
-        audioController.playTrack(track)
+        audioController.setQueueAndPlay(state.queue, index)
         loadLyricsForCurrentTrack(track)
         _uiState.update {
             it.copy(
@@ -286,7 +313,7 @@ class MusicPlayerStateHolder(
             _uiState.update { it.copy(isPlaying = false) }
         } else {
             if (audioController.getDurationMs() <= 0L) {
-                audioController.playTrack(current)
+                audioController.setQueueAndPlay(state.queue, state.currentQueueIndex)
                 if (state.positionMs > 0L) {
                     audioController.seekTo(state.positionMs)
                 }
@@ -306,6 +333,10 @@ class MusicPlayerStateHolder(
     fun skipNext() {
         val state = _uiState.value
         if (state.queue.isEmpty()) return
+
+        if (audioController.skipNextNative()) {
+            return
+        }
 
         val nextIndex = when {
             state.isShuffleEnabled && state.queue.size > 1 -> {
@@ -327,6 +358,10 @@ class MusicPlayerStateHolder(
         val state = _uiState.value
         if (state.queue.isEmpty()) return
 
+        if (audioController.skipPreviousNative()) {
+            return
+        }
+
         if (state.positionMs > 3000L) {
             seekTo(0L)
             return
@@ -340,18 +375,19 @@ class MusicPlayerStateHolder(
     }
 
     fun toggleShuffle() {
-        _uiState.update { it.copy(isShuffleEnabled = !it.isShuffleEnabled) }
+        val next = !_uiState.value.isShuffleEnabled
+        audioController.setShuffleEnabled(next)
+        _uiState.update { it.copy(isShuffleEnabled = next) }
     }
 
     fun cycleRepeatMode() {
-        _uiState.update { state ->
-            val next = when (state.repeatMode) {
-                RepeatMode.OFF -> RepeatMode.ALL
-                RepeatMode.ALL -> RepeatMode.ONE
-                RepeatMode.ONE -> RepeatMode.OFF
-            }
-            state.copy(repeatMode = next)
+        val next = when (_uiState.value.repeatMode) {
+            RepeatMode.OFF -> RepeatMode.ALL
+            RepeatMode.ALL -> RepeatMode.ONE
+            RepeatMode.ONE -> RepeatMode.OFF
         }
+        audioController.setRepeatMode(next)
+        _uiState.update { it.copy(repeatMode = next) }
     }
 
     fun toggleFavorite(trackId: String) {
