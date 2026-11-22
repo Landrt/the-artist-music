@@ -76,7 +76,7 @@ fun TheArtistMusicApp(
                 uiState = uiState,
                 bottomPaddingForMiniPlayer = uiState.currentTrack != null,
                 onSelectTab = stateHolder::selectTab,
-                onCycleSortOrder = stateHolder::cycleSortOrder,
+                onSelectSortOrder = stateHolder::setSortOrder,
                 onOpenCollection = stateHolder::openCollection,
                 onOpenNowPlaying = {
                     if (uiState.currentTrack == null && uiState.allTracks.isNotEmpty()) {
@@ -89,7 +89,9 @@ fun TheArtistMusicApp(
                 onToggleDarkTheme = stateHolder::toggleDarkTheme,
                 onRefreshLibrary = stateHolder::refreshLibrary,
                 onRequestAudioPermission = onRequestAudioPermission,
-                onPlayTracks = stateHolder::playTracks,
+                onPlayTracks = { tracks, index, shuffle ->
+                    stateHolder.playTracks(tracks, index, shuffle, openPlayer = true)
+                },
                 onPlayNext = stateHolder::playNextInQueue,
                 onToggleFavorite = stateHolder::toggleFavorite,
                 onCreatePlaylist = stateHolder::createPlaylist,

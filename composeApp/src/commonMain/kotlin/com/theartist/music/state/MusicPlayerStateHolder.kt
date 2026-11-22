@@ -143,13 +143,14 @@ class MusicPlayerStateHolder(
         _uiState.update { it.copy(selectedTab = tab, activeCollection = null) }
     }
 
+    fun setSortOrder(order: SortOrder) {
+        _uiState.update { it.copy(sortOrder = order) }
+    }
+
     fun cycleSortOrder() {
         _uiState.update { state ->
-            val next = when (state.sortOrder) {
-                SortOrder.TITLE_ASC -> SortOrder.ARTIST_ASC
-                SortOrder.ARTIST_ASC -> SortOrder.DURATION_DESC
-                SortOrder.DURATION_DESC -> SortOrder.TITLE_ASC
-            }
+            val entries = SortOrder.entries
+            val next = entries[(entries.indexOf(state.sortOrder) + 1) % entries.size]
             state.copy(sortOrder = next)
         }
     }
@@ -183,7 +184,12 @@ class MusicPlayerStateHolder(
         _uiState.update { it.copy(isQueueSheetOpen = open) }
     }
 
-    fun playTracks(tracks: List<Track>, startIndex: Int = 0, shuffle: Boolean = false) {
+    fun playTracks(
+        tracks: List<Track>,
+        startIndex: Int = 0,
+        shuffle: Boolean = false,
+        openPlayer: Boolean = true
+    ) {
         if (tracks.isEmpty()) return
         val ordered = if (shuffle) tracks.shuffled() else tracks
         val safeIndex = if (shuffle) 0 else startIndex.coerceIn(0, ordered.lastIndex)
@@ -196,6 +202,7 @@ class MusicPlayerStateHolder(
                 queue = ordered,
                 currentQueueIndex = safeIndex,
                 isPlaying = true,
+                isNowPlayingOpen = if (openPlayer) true else state.isNowPlayingOpen,
                 positionMs = 0L,
                 durationMs = target.durationMs,
                 isShuffleEnabled = if (shuffle) true else state.isShuffleEnabled,

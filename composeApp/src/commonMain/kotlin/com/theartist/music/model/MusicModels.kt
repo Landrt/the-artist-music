@@ -7,9 +7,11 @@ enum class RepeatMode {
 }
 
 enum class SortOrder(val label: String) {
-    TITLE_ASC("Titre (A-Z)"),
-    ARTIST_ASC("Artiste (A-Z)"),
-    DURATION_DESC("Durée")
+    DATE_ADDED_DESC("Ajoutés récemment"),
+    TITLE_ASC("Ordre alphabétique (A → Z)"),
+    TITLE_DESC("Ordre alphabétique (Z → A)"),
+    ARTIST_ASC("Par artiste (A → Z)"),
+    DURATION_DESC("Par durée")
 }
 
 enum class LibraryTab(val label: String) {
@@ -38,6 +40,7 @@ data class Track(
     val folderPath: String = "Mémoire interne partagée/Music/$folderName",
     val filePath: String? = null,
     val durationMs: Long,
+    val dateAddedSec: Long = 0L,
     val uri: String,
     val accentColorHex: Long,
     val artworkBytes: ByteArray? = null,
@@ -90,7 +93,7 @@ data class PlayerUiState(
     val isScanning: Boolean = false,
     val hasAudioPermission: Boolean = true,
     val selectedTab: LibraryTab = LibraryTab.SONGS,
-    val sortOrder: SortOrder = SortOrder.TITLE_ASC,
+    val sortOrder: SortOrder = SortOrder.DATE_ADDED_DESC,
     val activeCollection: QuickCollection? = null,
     val searchQuery: String = "",
     val isSearchActive: Boolean = false,

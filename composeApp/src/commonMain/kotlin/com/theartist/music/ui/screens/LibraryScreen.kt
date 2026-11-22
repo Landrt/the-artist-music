@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistAddCheck
 import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.Delete
@@ -95,7 +96,7 @@ fun LibraryScreen(
     uiState: PlayerUiState,
     bottomPaddingForMiniPlayer: Boolean,
     onSelectTab: (LibraryTab) -> Unit,
-    onCycleSortOrder: () -> Unit,
+    onSelectSortOrder: (SortOrder) -> Unit,
     onOpenCollection: (QuickCollection?) -> Unit,
     onOpenNowPlaying: () -> Unit,
     onToggleSearch: (Boolean) -> Unit,
@@ -113,6 +114,7 @@ fun LibraryScreen(
     var trackForOptions by remember { mutableStateOf<Track?>(null) }
     var trackForPlaylistPicker by remember { mutableStateOf<Track?>(null) }
     var showCreatePlaylistDialog by remember { mutableStateOf(false) }
+    var showSortSheet by remember { mutableStateOf(false) }
     var showTopMenu by remember { mutableStateOf(false) }
 
     val sortedAndFilteredTracks = remember(uiState.allTracks, uiState.searchQuery, uiState.sortOrder) {
@@ -128,7 +130,9 @@ fun LibraryScreen(
             }
         }
         when (uiState.sortOrder) {
+            SortOrder.DATE_ADDED_DESC -> filtered.sortedByDescending { it.dateAddedSec }
             SortOrder.TITLE_ASC -> filtered.sortedBy { it.title.lowercase() }
+            SortOrder.TITLE_DESC -> filtered.sortedByDescending { it.title.lowercase() }
             SortOrder.ARTIST_ASC -> filtered.sortedBy { it.artist.lowercase() }
             SortOrder.DURATION_DESC -> filtered.sortedByDescending { it.durationMs }
         }
@@ -391,7 +395,7 @@ fun LibraryScreen(
                         count = tracks.size,
                         sortOrderLabel = uiState.sortOrder.label,
                         onPlayAll = { onPlayTracks(tracks, 0, false) },
-                        onCycleSort = onCycleSortOrder,
+                        onCycleSort = { showSortSheet = true },
                         onOpenPlaylists = { onOpenCollection(QuickCollection.PlaylistsOverview) }
                     )
                 }
@@ -423,7 +427,7 @@ fun LibraryScreen(
                                 count = sortedAndFilteredTracks.size,
                                 sortOrderLabel = uiState.sortOrder.label,
                                 onPlayAll = { onPlayTracks(sortedAndFilteredTracks, 0, false) },
-                                onCycleSort = onCycleSortOrder,
+                                onCycleSort = { showSortSheet = true },
                                 onOpenPlaylists = { onOpenCollection(QuickCollection.PlaylistsOverview) }
                             )
                         }
@@ -543,6 +547,61 @@ fun LibraryScreen(
                                     onClick = { onOpenCollection(QuickCollection.FolderDetail(folderName)) }
                                 )
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort Order Bottom Sheet
+    if (showSortSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showSortSheet = false },
+            containerColor = MaterialTheme.colorScheme.surface
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 26.dp)
+            ) {
+                Text(
+                    text = "Trier les morceaux",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Spacer(modifier = Modifier.height(6.dp))
+
+                SortOrder.entries.forEach { order ->
+                    val isSelected = order == uiState.sortOrder
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onSelectSortOrder(order)
+                                showSortSheet = false
+                            }
+                            .padding(vertical = 13.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = order.label,
+                            fontSize = 15.5.sp,
+                            fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
+                            color = if (isSelected) ArtistCrimson else MaterialTheme.colorScheme.onSurface
+                        )
+                        if (isSelected) {
+                            Icon(
+                                imageVector = Icons.Rounded.Check,
+                                contentDescription = "Sélectionné",
+                                tint = ArtistCrimson,
+                                modifier = Modifier.size(20.dp)
+                            )
                         }
                     }
                 }

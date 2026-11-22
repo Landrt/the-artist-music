@@ -179,6 +179,7 @@ class DesktopLocalMusicScanner : LocalMusicScanner {
                         folderName = folder,
                         folderPath = file.parentFile?.absolutePath ?: "Mémoire interne partagée/Music/$folder",
                         durationMs = 210_000L,
+                        dateAddedSec = file.lastModified() / 1000L,
                         uri = "file://${file.absolutePath}",
                         accentColorHex = accentColorForKey("$folder-$artist"),
                         lyrics = lyrics,

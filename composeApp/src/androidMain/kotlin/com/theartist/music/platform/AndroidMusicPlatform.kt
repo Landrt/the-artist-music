@@ -1,5 +1,6 @@
 package com.theartist.music.platform
 
+import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
@@ -14,14 +15,23 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
 import com.theartist.music.R
 import com.theartist.music.model.Track
 import com.theartist.music.model.accentColorForKey
+import com.theartist.music.service.MusicPlaybackService
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.File
 
@@ -51,51 +61,101 @@ actual fun brandDisplayFontFamily(): FontFamily = FontFamily(
 )
 
 class AndroidAudioPlayerController(
-    context: Context
+    context: Context,
+    private val scanner: AndroidLocalMusicScanner
 ) : AudioPlayerController {
 
-    private val exoPlayer: ExoPlayer = ExoPlayer.Builder(context.applicationContext).build()
+    private val appContext = context.applicationContext
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val sessionToken = SessionToken(
+        appContext,
+        ComponentName(appContext, MusicPlaybackService::class.java)
+    )
+    private val controllerFuture = MediaController.Builder(appContext, sessionToken).buildAsync()
+    private var controller: MediaController? = null
+    private var pendingTrack: Track? = null
     private var onCompleted: (() -> Unit)? = null
 
     init {
-        exoPlayer.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED) {
-                    onCompleted?.invoke()
+        controllerFuture.addListener(
+            {
+                runCatching {
+                    val ctrl = controllerFuture.get()
+                    controller = ctrl
+                    ctrl.addListener(object : Player.Listener {
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            if (playbackState == Player.STATE_ENDED) {
+                                onCompleted?.invoke()
+                            }
+                        }
+                    })
+                    pendingTrack?.let { track ->
+                        pendingTrack = null
+                        startTrackOnController(ctrl, track)
+                    }
                 }
-            }
-        })
+            },
+            ContextCompat.getMainExecutor(appContext)
+        )
     }
 
     override fun playTrack(track: Track) {
-        val mediaItem = MediaItem.fromUri(Uri.parse(track.uri))
-        exoPlayer.setMediaItem(mediaItem)
-        exoPlayer.prepare()
-        exoPlayer.playWhenReady = true
+        val ctrl = controller
+        if (ctrl == null) {
+            pendingTrack = track
+            return
+        }
+        startTrackOnController(ctrl, track)
+    }
+
+    private fun startTrackOnController(ctrl: MediaController, track: Track) {
+        scope.launch {
+            val artBytes = withTimeoutOrNull(180L) {
+                scanner.loadArtworkBytes(track)
+            }
+            val metadataBuilder = MediaMetadata.Builder()
+                .setTitle(track.title)
+                .setArtist(track.artist)
+                .setAlbumTitle(track.album)
+            if (artBytes != null && artBytes.isNotEmpty()) {
+                metadataBuilder.setArtworkData(artBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+            }
+            val mediaItem = MediaItem.Builder()
+                .setMediaId(track.id)
+                .setUri(Uri.parse(track.uri))
+                .setMediaMetadata(metadataBuilder.build())
+                .build()
+
+            ctrl.setMediaItem(mediaItem)
+            ctrl.prepare()
+            ctrl.playWhenReady = true
+        }
     }
 
     override fun pause() {
-        exoPlayer.pause()
+        controller?.pause()
     }
 
     override fun resume() {
-        exoPlayer.play()
+        controller?.play()
     }
 
     override fun seekTo(positionMs: Long) {
-        exoPlayer.seekTo(positionMs)
+        controller?.seekTo(positionMs.coerceAtLeast(0L))
     }
 
     override fun getCurrentPositionMs(): Long {
-        return exoPlayer.currentPosition.coerceAtLeast(0L)
+        return controller?.currentPosition?.coerceAtLeast(0L) ?: 0L
     }
 
     override fun getDurationMs(): Long {
-        return exoPlayer.duration.takeIf { it > 0L } ?: 0L
+        val d = controller?.duration ?: 0L
+        return if (d > 0L) d else 0L
     }
 
     override fun isCurrentlyPlaying(): Boolean {
-        return exoPlayer.isPlaying
+        val ctrl = controller ?: return false
+        return ctrl.playWhenReady && ctrl.playbackState != Player.STATE_ENDED && ctrl.playbackState != Player.STATE_IDLE
     }
 
     override fun setOnTrackCompletedListener(listener: () -> Unit) {
@@ -103,13 +163,42 @@ class AndroidAudioPlayerController(
     }
 
     override fun release() {
-        exoPlayer.release()
+        scope.cancel()
+        MediaController.releaseFuture(controllerFuture)
+        controller = null
     }
 }
 
 class AndroidLocalMusicScanner(
     private val context: Context
 ) : LocalMusicScanner {
+
+    private val excludedPathKeywords = listOf(
+        "whatsapp",
+        "voice note",
+        "voicenote",
+        "voice_note",
+        "recordings",
+        "recording",
+        "soundrecorder",
+        "sound_recorder",
+        "voicerecorder",
+        "voice_recorder",
+        "callrecord",
+        "call_record",
+        "call recording",
+        "dictaphone",
+        "audionote",
+        "/record/",
+        "/records/",
+        "/alarms/",
+        "/ringtones/",
+        "/notifications/",
+        "ptt-",
+        "aud-"
+    )
+
+    private val excludedExtensions = setOf("amr", "3gp", "3gpp", "awb", "opus")
 
     override suspend fun scanLocalTracks(): List<Track> = withContext(Dispatchers.IO) {
         val results = mutableListOf<Track>()
@@ -125,6 +214,7 @@ class AndroidLocalMusicScanner(
             add(MediaStore.Audio.Media.ARTIST)
             add(MediaStore.Audio.Media.ALBUM)
             add(MediaStore.Audio.Media.DURATION)
+            add(MediaStore.Audio.Media.DATE_ADDED)
             add(MediaStore.Audio.Media.MIME_TYPE)
             add(MediaStore.Audio.Media.DATA)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -132,12 +222,12 @@ class AndroidLocalMusicScanner(
             }
         }.toTypedArray()
 
-        // Fast query: metadata only (no per-file MediaMetadataRetriever during scan!)
-        val selection = "${MediaStore.Audio.Media.DURATION} >= 5000 AND " +
+        // Only real songs >= 30 seconds, excluding ringtones, alarms, notifications
+        val selection = "${MediaStore.Audio.Media.DURATION} >= 30000 AND " +
             "${MediaStore.Audio.Media.IS_RINGTONE} = 0 AND " +
             "${MediaStore.Audio.Media.IS_ALARM} = 0 AND " +
             "${MediaStore.Audio.Media.IS_NOTIFICATION} = 0"
-        val sortOrder = "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
+        val sortOrder = "${MediaStore.Audio.Media.DATE_ADDED} DESC"
 
         runCatching {
             context.contentResolver.query(
@@ -152,6 +242,7 @@ class AndroidLocalMusicScanner(
                 val artistCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
                 val albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
                 val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                val dateAddedCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_ADDED)
                 val mimeCol = cursor.getColumnIndex(MediaStore.Audio.Media.MIME_TYPE)
                 val dataCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
                 val relPathCol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -159,16 +250,22 @@ class AndroidLocalMusicScanner(
                 } else -1
 
                 while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idCol)
+                    val filePath = if (dataCol >= 0) cursor.getString(dataCol) else null
+                    val relPath = if (relPathCol >= 0) cursor.getString(relPathCol) else null
                     val title = cursor.getString(titleCol)?.takeIf { it.isNotBlank() } ?: "Titre inconnu"
+
+                    if (isExcludedVoiceOrWhatsApp(filePath, relPath, title)) {
+                        continue
+                    }
+
+                    val id = cursor.getLong(idCol)
                     val rawArtist = cursor.getString(artistCol)
                     val artist = if (rawArtist.isNullOrBlank() || rawArtist == "<unknown>") "Artiste inconnu" else rawArtist
                     val rawAlbum = cursor.getString(albumCol)
                     val album = if (rawAlbum.isNullOrBlank() || rawAlbum == "<unknown>") "Album inconnu" else rawAlbum
                     val duration = cursor.getLong(durationCol).coerceAtLeast(0L)
+                    val dateAddedSec = if (dateAddedCol >= 0) cursor.getLong(dateAddedCol) else 0L
                     val mime = if (mimeCol >= 0) cursor.getString(mimeCol) else null
-                    val filePath = if (dataCol >= 0) cursor.getString(dataCol) else null
-                    val relPath = if (relPathCol >= 0) cursor.getString(relPathCol) else null
 
                     val folderName = extractFolderName(relPath, filePath)
                     val displayFolderPath = relPath
@@ -190,10 +287,11 @@ class AndroidLocalMusicScanner(
                         folderPath = displayFolderPath,
                         filePath = filePath,
                         durationMs = duration,
+                        dateAddedSec = dateAddedSec,
                         uri = contentUri.toString(),
                         accentColorHex = accentColorForKey("$album-$artist"),
-                        artworkBytes = null, // Loaded lazily on demand!
-                        lyrics = null,       // Loaded lazily on demand!
+                        artworkBytes = null,
+                        lyrics = null,
                         formatInfo = formatLabel
                     )
                 }
@@ -202,10 +300,25 @@ class AndroidLocalMusicScanner(
         results
     }
 
+    private fun isExcludedVoiceOrWhatsApp(
+        filePath: String?,
+        relPath: String?,
+        title: String
+    ): Boolean {
+        val combined = "${relPath.orEmpty()} ${filePath.orEmpty()} $title".lowercase()
+        if (excludedPathKeywords.any { it in combined }) {
+            return true
+        }
+        val ext = filePath?.substringAfterLast('.', "")?.lowercase().orEmpty()
+        if (ext in excludedExtensions) {
+            return true
+        }
+        return false
+    }
+
     override suspend fun loadArtworkBytes(track: Track): ByteArray? = withContext(Dispatchers.IO) {
         val uri = runCatching { Uri.parse(track.uri) }.getOrNull() ?: return@withContext null
 
-        // Fast path on Android 10+: MediaStore cached thumbnail
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val thumbBytes = runCatching {
                 val bmp = context.contentResolver.loadThumbnail(uri, Size(400, 400), null)
@@ -219,7 +332,6 @@ class AndroidLocalMusicScanner(
             }
         }
 
-        // Fallback: MediaMetadataRetriever embedded picture
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, uri)
