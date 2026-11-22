@@ -472,8 +472,7 @@ fun LibraryScreen(
                                 ArtistRow(
                                     artistName = artistName,
                                     trackCount = artistTracks.size,
-                                    accentColorHex = rep.accentColorHex,
-                                    artworkBytes = rep.artworkBytes,
+                                    repTrack = rep,
                                     onClick = { onOpenCollection(QuickCollection.ArtistDetail(artistName)) }
                                 )
                             }
@@ -507,8 +506,7 @@ fun LibraryScreen(
                                     albumName = albumName,
                                     artistName = rep.artist,
                                     trackCount = albumTracks.size,
-                                    accentColorHex = rep.accentColorHex,
-                                    artworkBytes = rep.artworkBytes,
+                                    repTrack = rep,
                                     onClick = { onOpenCollection(QuickCollection.AlbumDetail(albumName)) }
                                 )
                             }
@@ -570,6 +568,7 @@ fun LibraryScreen(
                     ArtworkBox(
                         accentColorHex = selectedTrack.accentColorHex,
                         artworkBytes = selectedTrack.artworkBytes,
+                        track = selectedTrack,
                         cornerRadius = 8.dp,
                         iconSize = 20.dp,
                         modifier = Modifier.size(44.dp)
@@ -984,8 +983,7 @@ private fun SongRow(
 private fun ArtistRow(
     artistName: String,
     trackCount: Int,
-    accentColorHex: Long,
-    artworkBytes: ByteArray?,
+    repTrack: Track,
     onClick: () -> Unit
 ) {
     Column(
@@ -1000,8 +998,9 @@ private fun ArtistRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             ArtworkBox(
-                accentColorHex = accentColorHex,
-                artworkBytes = artworkBytes,
+                accentColorHex = repTrack.accentColorHex,
+                artworkBytes = repTrack.artworkBytes,
+                track = repTrack,
                 shape = CircleShape,
                 iconSize = 24.dp,
                 modifier = Modifier.size(52.dp)
@@ -1036,8 +1035,7 @@ private fun AlbumRow(
     albumName: String,
     artistName: String,
     trackCount: Int,
-    accentColorHex: Long,
-    artworkBytes: ByteArray?,
+    repTrack: Track,
     onClick: () -> Unit
 ) {
     Column(
@@ -1052,8 +1050,9 @@ private fun AlbumRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             ArtworkBox(
-                accentColorHex = accentColorHex,
-                artworkBytes = artworkBytes,
+                accentColorHex = repTrack.accentColorHex,
+                artworkBytes = repTrack.artworkBytes,
+                track = repTrack,
                 cornerRadius = 8.dp,
                 iconSize = 24.dp,
                 modifier = Modifier.size(52.dp)

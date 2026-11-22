@@ -2,11 +2,13 @@ package com.theartist.music.platform
 
 import android.content.ContentUris
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Size
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.Font
@@ -20,11 +22,20 @@ import com.theartist.music.model.Track
 import com.theartist.music.model.accentColorForKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? {
     return runCatching {
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val maxSide = maxOf(bounds.outWidth, bounds.outHeight)
+        var sample = 1
+        while (maxSide / sample > 512) {
+            sample *= 2
+        }
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.asImageBitmap()
     }.getOrNull()
 }
 
@@ -102,6 +113,12 @@ class AndroidLocalMusicScanner(
 
     override suspend fun scanLocalTracks(): List<Track> = withContext(Dispatchers.IO) {
         val results = mutableListOf<Track>()
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        }
+
         val projection = buildList {
             add(MediaStore.Audio.Media._ID)
             add(MediaStore.Audio.Media.TITLE)
@@ -115,12 +132,16 @@ class AndroidLocalMusicScanner(
             }
         }.toTypedArray()
 
-        val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND ${MediaStore.Audio.Media.DURATION} > 5000"
-        val sortOrder = "${MediaStore.Audio.Media.TITLE} ASC"
+        // Fast query: metadata only (no per-file MediaMetadataRetriever during scan!)
+        val selection = "${MediaStore.Audio.Media.DURATION} >= 5000 AND " +
+            "${MediaStore.Audio.Media.IS_RINGTONE} = 0 AND " +
+            "${MediaStore.Audio.Media.IS_ALARM} = 0 AND " +
+            "${MediaStore.Audio.Media.IS_NOTIFICATION} = 0"
+        val sortOrder = "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
 
         runCatching {
             context.contentResolver.query(
-                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                collection,
                 projection,
                 selection,
                 null,
@@ -154,14 +175,10 @@ class AndroidLocalMusicScanner(
                         ?.trimEnd('/')
                         ?.takeIf { it.isNotBlank() }
                         ?.let { "Mémoire interne partagée/$it" }
+                        ?: filePath?.let { File(it).parentFile?.path }
                         ?: "Mémoire interne partagée/Music/$folderName"
-                    val contentUri = ContentUris.withAppendedId(
-                        MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                        id
-                    )
 
-                    val artwork = loadEmbeddedArt(contentUri)
-                    val sidecarLyrics = readSidecarLrc(filePath)
+                    val contentUri = ContentUris.withAppendedId(collection, id)
                     val formatLabel = mime?.substringAfter('/')?.uppercase() ?: "HQ"
 
                     results += Track(
@@ -171,11 +188,12 @@ class AndroidLocalMusicScanner(
                         album = album,
                         folderName = folderName,
                         folderPath = displayFolderPath,
+                        filePath = filePath,
                         durationMs = duration,
                         uri = contentUri.toString(),
                         accentColorHex = accentColorForKey("$album-$artist"),
-                        artworkBytes = artwork,
-                        lyrics = sidecarLyrics,
+                        artworkBytes = null, // Loaded lazily on demand!
+                        lyrics = null,       // Loaded lazily on demand!
                         formatInfo = formatLabel
                     )
                 }
@@ -184,17 +202,26 @@ class AndroidLocalMusicScanner(
         results
     }
 
-    private fun extractFolderName(relativePath: String?, filePath: String?): String {
-        val fromRel = relativePath?.trimEnd('/')?.substringAfterLast('/')
-        if (!fromRel.isNullOrBlank()) return fromRel
-        val fromFile = filePath?.let { File(it).parentFile?.name }
-        if (!fromFile.isNullOrBlank()) return fromFile
-        return "Musique"
-    }
+    override suspend fun loadArtworkBytes(track: Track): ByteArray? = withContext(Dispatchers.IO) {
+        val uri = runCatching { Uri.parse(track.uri) }.getOrNull() ?: return@withContext null
 
-    private fun loadEmbeddedArt(uri: Uri): ByteArray? {
+        // Fast path on Android 10+: MediaStore cached thumbnail
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val thumbBytes = runCatching {
+                val bmp = context.contentResolver.loadThumbnail(uri, Size(400, 400), null)
+                val out = ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                bmp.recycle()
+                out.toByteArray()
+            }.getOrNull()
+            if (thumbBytes != null && thumbBytes.isNotEmpty()) {
+                return@withContext thumbBytes
+            }
+        }
+
+        // Fallback: MediaMetadataRetriever embedded picture
         val retriever = MediaMetadataRetriever()
-        return try {
+        try {
             retriever.setDataSource(context, uri)
             retriever.embeddedPicture
         } catch (_: Throwable) {
@@ -204,9 +231,9 @@ class AndroidLocalMusicScanner(
         }
     }
 
-    private fun readSidecarLrc(filePath: String?): String? {
-        if (filePath.isNullOrBlank()) return null
-        return runCatching {
+    override suspend fun loadLyrics(track: Track): String? = withContext(Dispatchers.IO) {
+        val filePath = track.filePath ?: return@withContext null
+        runCatching {
             val audioFile = File(filePath)
             val lrcFile = File(audioFile.parentFile, "${audioFile.nameWithoutExtension}.lrc")
             if (lrcFile.exists() && lrcFile.canRead()) {
@@ -219,5 +246,13 @@ class AndroidLocalMusicScanner(
                 null
             }
         }.getOrNull()
+    }
+
+    private fun extractFolderName(relativePath: String?, filePath: String?): String {
+        val fromRel = relativePath?.trimEnd('/')?.substringAfterLast('/')
+        if (!fromRel.isNullOrBlank()) return fromRel
+        val fromFile = filePath?.let { File(it).parentFile?.name }
+        if (!fromFile.isNullOrBlank()) return fromFile
+        return "Musique"
     }
 }

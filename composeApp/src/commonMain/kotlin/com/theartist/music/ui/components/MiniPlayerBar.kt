@@ -79,6 +79,7 @@ fun MiniPlayerBar(
             ArtworkBox(
                 accentColorHex = track.accentColorHex,
                 artworkBytes = track.artworkBytes,
+                track = track,
                 cornerRadius = 7.dp,
                 iconSize = 19.dp,
                 modifier = Modifier.size(42.dp)

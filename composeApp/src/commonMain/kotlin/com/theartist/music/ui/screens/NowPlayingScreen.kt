@@ -235,6 +235,7 @@ fun NowPlayingScreen(
                         ArtworkBox(
                             accentColorHex = track.accentColorHex,
                             artworkBytes = track.artworkBytes,
+                            track = track,
                             cornerRadius = 16.dp,
                             iconSize = 84.dp,
                             modifier = Modifier.fillMaxSize()

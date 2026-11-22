@@ -30,6 +30,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -43,6 +44,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.theartist.music.state.MusicPlayerStateHolder
+import com.theartist.music.ui.components.LocalArtworkLoader
 import com.theartist.music.ui.components.MiniPlayerBar
 import com.theartist.music.ui.components.PlayingEqualizerBars
 import com.theartist.music.ui.screens.LibraryScreen
@@ -68,6 +70,7 @@ fun TheArtistMusicApp(
     }
 
     TheArtistMusicTheme(darkTheme = uiState.isDarkTheme) {
+        CompositionLocalProvider(LocalArtworkLoader provides stateHolder::loadArtworkBitmap) {
         Box(modifier = Modifier.fillMaxSize()) {
             LibraryScreen(
                 uiState = uiState,
@@ -230,6 +233,7 @@ fun TheArtistMusicApp(
             ) {
                 SplashScreen()
             }
+        }
         }
     }
 }

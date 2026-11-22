@@ -18,6 +18,8 @@ interface AudioPlayerController {
 
 interface LocalMusicScanner {
     suspend fun scanLocalTracks(): List<Track>
+    suspend fun loadArtworkBytes(track: Track): ByteArray? = track.artworkBytes
+    suspend fun loadLyrics(track: Track): String? = track.lyrics
 }
 
 expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?

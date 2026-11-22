@@ -22,14 +22,19 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -37,6 +42,7 @@ import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.theartist.music.model.Track
 import com.theartist.music.platform.decodeImageBitmap
 import com.theartist.music.ui.theme.ArtistSplashBlue
 import com.theartist.music.ui.theme.ArtistSplashCyan
@@ -45,18 +51,31 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 
+val LocalArtworkLoader = compositionLocalOf<(suspend (Track) -> ImageBitmap?)?> { null }
+
 @Composable
 fun ArtworkBox(
     accentColorHex: Long,
     artworkBytes: ByteArray?,
     modifier: Modifier = Modifier,
+    track: Track? = null,
     cornerRadius: Dp = 8.dp,
     shape: Shape = RoundedCornerShape(cornerRadius),
     iconSize: Dp = 22.dp
 ) {
-    val decodedBitmap = remember(artworkBytes) {
+    val loader = LocalArtworkLoader.current
+    val inlineBitmap = remember(artworkBytes) {
         artworkBytes?.let { decodeImageBitmap(it) }
     }
+    var lazyBitmap by remember(track?.id) { mutableStateOf<ImageBitmap?>(null) }
+
+    LaunchedEffect(track?.id, inlineBitmap, loader) {
+        if (inlineBitmap == null && track != null && loader != null) {
+            lazyBitmap = loader(track)
+        }
+    }
+
+    val decodedBitmap = inlineBitmap ?: lazyBitmap
     val baseColor = remember(accentColorHex) { Color(accentColorHex) }
     val darkTint = remember(baseColor) {
         Color(

@@ -36,6 +36,7 @@ data class Track(
     val album: String,
     val folderName: String,
     val folderPath: String = "Mémoire interne partagée/Music/$folderName",
+    val filePath: String? = null,
     val durationMs: Long,
     val uri: String,
     val accentColorHex: Long,

@@ -1,5 +1,6 @@
 package com.theartist.music.state
 
+import androidx.compose.ui.graphics.ImageBitmap
 import com.theartist.music.model.LibraryTab
 import com.theartist.music.model.PlayerUiState
 import com.theartist.music.model.Playlist
@@ -9,6 +10,7 @@ import com.theartist.music.model.SortOrder
 import com.theartist.music.model.Track
 import com.theartist.music.platform.AudioPlayerController
 import com.theartist.music.platform.LocalMusicScanner
+import com.theartist.music.platform.decodeImageBitmap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -30,6 +32,34 @@ class MusicPlayerStateHolder(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var progressJob: Job? = null
     private var playlistCounter = 1
+    private val artworkCache = LinkedHashMap<String, ImageBitmap?>()
+
+    suspend fun loadArtworkBitmap(track: Track): ImageBitmap? {
+        if (artworkCache.containsKey(track.id)) {
+            return artworkCache[track.id]
+        }
+        val bytes = track.artworkBytes ?: scanner.loadArtworkBytes(track)
+        val bitmap = bytes?.let { decodeImageBitmap(it) }
+        if (artworkCache.size >= 80) {
+            val oldestKey = artworkCache.keys.firstOrNull()
+            if (oldestKey != null) artworkCache.remove(oldestKey)
+        }
+        artworkCache[track.id] = bitmap
+        return bitmap
+    }
+
+    private fun loadLyricsForCurrentTrack(track: Track) {
+        if (!track.lyrics.isNullOrBlank()) return
+        scope.launch {
+            val loaded = scanner.loadLyrics(track) ?: return@launch
+            _uiState.update { state ->
+                state.copy(
+                    allTracks = state.allTracks.map { if (it.id == track.id) it.copy(lyrics = loaded) else it },
+                    queue = state.queue.map { if (it.id == track.id) it.copy(lyrics = loaded) else it }
+                )
+            }
+        }
+    }
 
     private val _uiState = MutableStateFlow(
         PlayerUiState(
@@ -65,42 +95,46 @@ class MusicPlayerStateHolder(
     fun refreshLibrary() {
         scope.launch {
             _uiState.update { it.copy(isScanning = true) }
-            val tracks = scanner.scanLocalTracks()
-            _uiState.update { state ->
-                val updatedQueue = if (state.queue.isEmpty() && tracks.isNotEmpty()) {
-                    tracks
-                } else {
-                    state.queue
-                }
-                val updatedIndex = if (state.currentQueueIndex == -1 && updatedQueue.isNotEmpty()) {
-                    0
-                } else {
-                    state.currentQueueIndex
-                }
-                val seededPlaylists = if (
-                    state.playlists.all { it.trackIds.isEmpty() } && tracks.size >= 2
-                ) {
-                    state.playlists.mapIndexed { idx, pl ->
-                        val slice = if (idx == 0) tracks.take(4) else tracks.drop(2).take(4)
-                        pl.copy(trackIds = slice.map { it.id })
+            try {
+                val tracks = scanner.scanLocalTracks()
+                _uiState.update { state ->
+                    val updatedQueue = if (state.queue.isEmpty() && tracks.isNotEmpty()) {
+                        tracks
+                    } else {
+                        state.queue
                     }
-                } else {
-                    state.playlists
+                    val updatedIndex = if (state.currentQueueIndex == -1 && updatedQueue.isNotEmpty()) {
+                        0
+                    } else {
+                        state.currentQueueIndex
+                    }
+                    val seededPlaylists = if (
+                        state.playlists.all { it.trackIds.isEmpty() } && tracks.size >= 2
+                    ) {
+                        state.playlists.mapIndexed { idx, pl ->
+                            val slice = if (idx == 0) tracks.take(4) else tracks.drop(2).take(4)
+                            pl.copy(trackIds = slice.map { it.id })
+                        }
+                    } else {
+                        state.playlists
+                    }
+                    val seededFavorites = if (state.favoriteIds.isEmpty() && tracks.isNotEmpty()) {
+                        setOf(tracks.first().id)
+                    } else {
+                        state.favoriteIds
+                    }
+                    state.copy(
+                        allTracks = tracks,
+                        isScanning = false,
+                        queue = updatedQueue,
+                        currentQueueIndex = updatedIndex,
+                        durationMs = updatedQueue.getOrNull(updatedIndex)?.durationMs ?: state.durationMs,
+                        playlists = seededPlaylists,
+                        favoriteIds = seededFavorites
+                    )
                 }
-                val seededFavorites = if (state.favoriteIds.isEmpty() && tracks.isNotEmpty()) {
-                    setOf(tracks.first().id)
-                } else {
-                    state.favoriteIds
-                }
-                state.copy(
-                    allTracks = tracks,
-                    isScanning = false,
-                    queue = updatedQueue,
-                    currentQueueIndex = updatedIndex,
-                    durationMs = updatedQueue.getOrNull(updatedIndex)?.durationMs ?: state.durationMs,
-                    playlists = seededPlaylists,
-                    favoriteIds = seededFavorites
-                )
+            } finally {
+                _uiState.update { it.copy(isScanning = false) }
             }
         }
     }
@@ -156,6 +190,7 @@ class MusicPlayerStateHolder(
         val target = ordered[safeIndex]
 
         audioController.playTrack(target)
+        loadLyricsForCurrentTrack(target)
         _uiState.update { state ->
             state.copy(
                 queue = ordered,
@@ -173,6 +208,7 @@ class MusicPlayerStateHolder(
         val state = _uiState.value
         val track = state.queue.getOrNull(index) ?: return
         audioController.playTrack(track)
+        loadLyricsForCurrentTrack(track)
         _uiState.update {
             it.copy(
                 currentQueueIndex = index,
