@@ -22,7 +22,9 @@ import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.theartist.music.R
+import com.theartist.music.model.Playlist
 import com.theartist.music.model.RepeatMode
+import com.theartist.music.model.SortOrder
 import com.theartist.music.model.Track
 import com.theartist.music.model.accentColorForKey
 import com.theartist.music.service.MusicPlaybackService
@@ -33,6 +35,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 
@@ -61,6 +65,95 @@ actual fun brandDisplayFontFamily(): FontFamily = FontFamily(
     Font(R.font.brand_display, FontWeight.Bold)
 )
 
+class AndroidPreferencesStorage(
+    context: Context
+) : LocalPreferencesStorage {
+
+    private val prefs = context.applicationContext.getSharedPreferences(
+        "the_artist_music_prefs",
+        Context.MODE_PRIVATE
+    )
+
+    override fun load(): PersistedAppData {
+        return runCatching {
+            val favs = prefs.getStringSet("favorite_ids", emptySet()).orEmpty().toSet()
+            val sortName = prefs.getString("sort_order", SortOrder.DATE_ADDED_DESC.name)
+            val sortOrder = SortOrder.entries.firstOrNull { it.name == sortName } ?: SortOrder.DATE_ADDED_DESC
+            val repeatName = prefs.getString("repeat_mode", RepeatMode.ALL.name)
+            val repeatMode = RepeatMode.entries.firstOrNull { it.name == repeatName } ?: RepeatMode.ALL
+            val isDark = prefs.getBoolean("is_dark_theme", true)
+            val isShuffle = prefs.getBoolean("is_shuffle_enabled", false)
+            val lastTrackId = prefs.getString("last_track_id", null)
+
+            val playlistsJson = prefs.getString("playlists_json", null)
+            val playlists = if (!playlistsJson.isNullOrBlank()) {
+                parsePlaylists(playlistsJson)
+            } else {
+                emptyList()
+            }
+
+            PersistedAppData(
+                favoriteIds = favs,
+                playlists = playlists,
+                sortOrder = sortOrder,
+                isDarkTheme = isDark,
+                isShuffleEnabled = isShuffle,
+                repeatMode = repeatMode,
+                lastTrackId = lastTrackId
+            )
+        }.getOrDefault(PersistedAppData())
+    }
+
+    override fun save(data: PersistedAppData) {
+        runCatching {
+            prefs.edit()
+                .putStringSet("favorite_ids", data.favoriteIds)
+                .putString("playlists_json", serializePlaylists(data.playlists))
+                .putString("sort_order", data.sortOrder.name)
+                .putString("repeat_mode", data.repeatMode.name)
+                .putBoolean("is_dark_theme", data.isDarkTheme)
+                .putBoolean("is_shuffle_enabled", data.isShuffleEnabled)
+                .putString("last_track_id", data.lastTrackId)
+                .apply()
+        }
+    }
+
+    private fun serializePlaylists(playlists: List<Playlist>): String {
+        val arr = JSONArray()
+        playlists.forEach { pl ->
+            val obj = JSONObject()
+            obj.put("id", pl.id)
+            obj.put("name", pl.name)
+            val ids = JSONArray()
+            pl.trackIds.forEach { ids.put(it) }
+            obj.put("trackIds", ids)
+            arr.put(obj)
+        }
+        return arr.toString()
+    }
+
+    private fun parsePlaylists(raw: String): List<Playlist> {
+        val arr = JSONArray(raw)
+        val out = mutableListOf<Playlist>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val id = obj.optString("id")
+            val name = obj.optString("name")
+            if (id.isBlank() || name.isBlank()) continue
+            val idsArr = obj.optJSONArray("trackIds")
+            val ids = mutableListOf<String>()
+            if (idsArr != null) {
+                for (j in 0 until idsArr.length()) {
+                    val tId = idsArr.optString(j)
+                    if (tId.isNotBlank()) ids += tId
+                }
+            }
+            out += Playlist(id = id, name = name, trackIds = ids)
+        }
+        return out
+    }
+}
+
 class AndroidAudioPlayerController(
     context: Context,
     private val scanner: AndroidLocalMusicScanner
@@ -76,7 +169,8 @@ class AndroidAudioPlayerController(
 
     private var controller: MediaController? = null
     private var pendingQueue: Pair<List<Track>, Int>? = null
-    private var desiredShuffle: Boolean = false
+    private var fullQueue: List<Track> = emptyList()
+    private var windowEndGlobalIndex: Int = 0
     private var desiredRepeat: RepeatMode = RepeatMode.ALL
     private var onCompleted: (() -> Unit)? = null
     private var onTrackChanged: ((String) -> Unit)? = null
@@ -88,11 +182,15 @@ class AndroidAudioPlayerController(
                 runCatching {
                     val ctrl = controllerFuture.get()
                     controller = ctrl
-                    applyModes(ctrl)
+                    // SmartShuffleEngine owns the exact queue order, so keep ExoPlayer linear
+                    ctrl.shuffleModeEnabled = false
+                    ctrl.repeatMode = toExoRepeatMode(desiredRepeat)
+
                     ctrl.addListener(object : Player.Listener {
                         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                             val id = mediaItem?.mediaId ?: return
                             onTrackChanged?.invoke(id)
+                            maybeAppendMoreTracks(ctrl)
                         }
 
                         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -112,9 +210,17 @@ class AndroidAudioPlayerController(
                         }
                     })
 
-                    pendingQueue?.let { (tracks, startIndex) ->
+                    val queued = pendingQueue
+                    if (queued != null) {
                         pendingQueue = null
-                        startQueueOnController(ctrl, tracks, startIndex)
+                        startQueueOnController(ctrl, queued.first, queued.second)
+                    } else {
+                        // Re-attach cleanly if MusicPlaybackService is already playing in background
+                        val activeId = ctrl.currentMediaItem?.mediaId
+                        if (activeId != null) {
+                            onTrackChanged?.invoke(activeId)
+                            onPlayingStateChanged?.invoke(ctrl.isPlaying || ctrl.playWhenReady)
+                        }
                     }
                 }
             },
@@ -129,6 +235,7 @@ class AndroidAudioPlayerController(
     override fun setQueueAndPlay(tracks: List<Track>, startIndex: Int) {
         if (tracks.isEmpty()) return
         val safeIdx = startIndex.coerceIn(0, tracks.lastIndex)
+        fullQueue = tracks
         val ctrl = controller
         if (ctrl == null) {
             pendingQueue = tracks to safeIdx
@@ -137,15 +244,53 @@ class AndroidAudioPlayerController(
         startQueueOnController(ctrl, tracks, safeIdx)
     }
 
+    override fun updateQueueKeepingCurrent(tracks: List<Track>, currentIndex: Int) {
+        fullQueue = tracks
+        val ctrl = controller ?: return
+        if (tracks.isEmpty() || currentIndex !in tracks.indices) return
+
+        val playingIdx = ctrl.currentMediaItemIndex
+        val playingId = ctrl.currentMediaItem?.mediaId
+        val targetTrack = tracks[currentIndex]
+
+        // Only mutate in-place if the same track is currently loaded in ExoPlayer
+        if (playingIdx < 0 || playingId != targetTrack.id) {
+            return
+        }
+
+        // Remove items after current, then items before current (current stays untouched at index 0!)
+        if (playingIdx + 1 < ctrl.mediaItemCount) {
+            ctrl.removeMediaItems(playingIdx + 1, ctrl.mediaItemCount)
+        }
+        if (playingIdx > 0) {
+            ctrl.removeMediaItems(0, playingIdx)
+        }
+
+        val beforeStart = (currentIndex - 50).coerceAtLeast(0)
+        val afterEnd = (currentIndex + 101).coerceAtMost(tracks.size)
+        windowEndGlobalIndex = afterEnd
+
+        val beforeItems = tracks.subList(beforeStart, currentIndex).map { buildMediaItem(it, null) }
+        val afterItems = tracks.subList(currentIndex + 1, afterEnd).map { buildMediaItem(it, null) }
+
+        if (beforeItems.isNotEmpty()) {
+            ctrl.addMediaItems(0, beforeItems)
+        }
+        if (afterItems.isNotEmpty()) {
+            ctrl.addMediaItems(afterItems)
+        }
+        ctrl.shuffleModeEnabled = false
+        ctrl.repeatMode = toExoRepeatMode(desiredRepeat)
+    }
+
     private fun startQueueOnController(
         ctrl: MediaController,
         tracks: List<Track>,
         startIndex: Int
     ) {
-        // Keep IPC payload safe (<1 MB Binder limit) with a 200-track window centered on startIndex
-        val windowRadius = 100
-        val fromIndex = (startIndex - windowRadius).coerceAtLeast(0)
-        val toIndex = (startIndex + windowRadius + 1).coerceAtMost(tracks.size)
+        val fromIndex = (startIndex - 60).coerceAtLeast(0)
+        val toIndex = (startIndex + 120).coerceAtMost(tracks.size)
+        windowEndGlobalIndex = toIndex
         val windowTracks = tracks.subList(fromIndex, toIndex)
         val localStartIndex = startIndex - fromIndex
         val activeTrack = windowTracks[localStartIndex]
@@ -156,32 +301,54 @@ class AndroidAudioPlayerController(
             }
 
             val mediaItems = windowTracks.mapIndexed { idx, track ->
-                val metadataBuilder = MediaMetadata.Builder()
-                    .setTitle(track.title)
-                    .setArtist(track.artist)
-                    .setAlbumTitle(track.album)
-
-                track.albumId?.let { albId ->
-                    val artUri = ContentUris.withAppendedId(ALBUM_ART_URI, albId)
-                    metadataBuilder.setArtworkUri(artUri)
-                }
-
-                if (idx == localStartIndex && activeArtBytes != null && activeArtBytes.isNotEmpty()) {
-                    metadataBuilder.setArtworkData(activeArtBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
-                }
-
-                MediaItem.Builder()
-                    .setMediaId(track.id)
-                    .setUri(Uri.parse(track.uri))
-                    .setMediaMetadata(metadataBuilder.build())
-                    .build()
+                buildMediaItem(
+                    track = track,
+                    embeddedArt = if (idx == localStartIndex) activeArtBytes else null
+                )
             }
 
-            applyModes(ctrl)
+            ctrl.shuffleModeEnabled = false
+            ctrl.repeatMode = toExoRepeatMode(desiredRepeat)
             ctrl.setMediaItems(mediaItems, localStartIndex, 0L)
             ctrl.prepare()
             ctrl.playWhenReady = true
         }
+    }
+
+    private fun maybeAppendMoreTracks(ctrl: MediaController) {
+        if (fullQueue.isEmpty() || windowEndGlobalIndex >= fullQueue.size) return
+        val remainingInWindow = ctrl.mediaItemCount - 1 - ctrl.currentMediaItemIndex
+        if (remainingInWindow <= 25) {
+            val nextEnd = (windowEndGlobalIndex + 80).coerceAtMost(fullQueue.size)
+            val nextBatch = fullQueue.subList(windowEndGlobalIndex, nextEnd)
+                .map { buildMediaItem(it, null) }
+            windowEndGlobalIndex = nextEnd
+            if (nextBatch.isNotEmpty()) {
+                ctrl.addMediaItems(nextBatch)
+            }
+        }
+    }
+
+    private fun buildMediaItem(track: Track, embeddedArt: ByteArray?): MediaItem {
+        val metadataBuilder = MediaMetadata.Builder()
+            .setTitle(track.title)
+            .setArtist(track.artist)
+            .setAlbumTitle(track.album)
+
+        track.albumId?.let { albId ->
+            val artUri = ContentUris.withAppendedId(ALBUM_ART_URI, albId)
+            metadataBuilder.setArtworkUri(artUri)
+        }
+
+        if (embeddedArt != null && embeddedArt.isNotEmpty()) {
+            metadataBuilder.setArtworkData(embeddedArt, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+        }
+
+        return MediaItem.Builder()
+            .setMediaId(track.id)
+            .setUri(Uri.parse(track.uri))
+            .setMediaMetadata(metadataBuilder.build())
+            .build()
     }
 
     override fun skipNextNative(): Boolean {
@@ -203,15 +370,14 @@ class AndroidAudioPlayerController(
     override fun skipPreviousNative(): Boolean {
         val ctrl = controller ?: return false
         if (ctrl.mediaItemCount == 0) return false
-        // ExoPlayer native seekToPrevious(): >3s restarts current track; <=3s jumps to previous track!
         ctrl.seekToPrevious()
         ctrl.playWhenReady = true
         return true
     }
 
     override fun setShuffleEnabled(enabled: Boolean) {
-        desiredShuffle = enabled
-        controller?.shuffleModeEnabled = enabled
+        // SmartShuffleEngine reorders the queue directly; ExoPlayer stays linear so UI & Dynamic Island match 100%
+        controller?.shuffleModeEnabled = false
     }
 
     override fun setRepeatMode(mode: RepeatMode) {
@@ -261,11 +427,6 @@ class AndroidAudioPlayerController(
         scope.cancel()
         MediaController.releaseFuture(controllerFuture)
         controller = null
-    }
-
-    private fun applyModes(ctrl: MediaController) {
-        ctrl.shuffleModeEnabled = desiredShuffle
-        ctrl.repeatMode = toExoRepeatMode(desiredRepeat)
     }
 
     private fun toExoRepeatMode(mode: RepeatMode): Int = when (mode) {
@@ -333,7 +494,6 @@ class AndroidLocalMusicScanner(
             }
         }.toTypedArray()
 
-        // Only real songs >= 30 seconds, excluding ringtones, alarms, notifications
         val selection = "${MediaStore.Audio.Media.DURATION} >= 30000 AND " +
             "${MediaStore.Audio.Media.IS_RINGTONE} = 0 AND " +
             "${MediaStore.Audio.Media.IS_ALARM} = 0 AND " +

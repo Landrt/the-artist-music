@@ -24,6 +24,7 @@ class MusicPlaybackService : MediaSessionService() {
         val player = ExoPlayer.Builder(this)
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
+            .setWakeMode(C.WAKE_MODE_LOCAL)
             .build()
 
         val openAppIntent = Intent(this, MainActivity::class.java).apply {

@@ -10,7 +10,10 @@ import com.theartist.music.model.SortOrder
 import com.theartist.music.model.Track
 import com.theartist.music.platform.AudioPlayerController
 import com.theartist.music.platform.LocalMusicScanner
+import com.theartist.music.platform.LocalPreferencesStorage
+import com.theartist.music.platform.PersistedAppData
 import com.theartist.music.platform.decodeImageBitmap
+import com.theartist.music.shuffle.SmartShuffleEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,12 +30,63 @@ import kotlinx.coroutines.launch
 class MusicPlayerStateHolder(
     private val scanner: LocalMusicScanner,
     private val audioController: AudioPlayerController,
+    private val storage: LocalPreferencesStorage? = null,
     initialPermissionGranted: Boolean = true
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var progressJob: Job? = null
     private var playlistCounter = 1
     private val artworkCache = LinkedHashMap<String, ImageBitmap?>()
+
+    // Preserves the original unshuffled order so disabling Smart Shuffle restores it cleanly
+    private var originalQueue: List<Track> = emptyList()
+    private var persistedLastTrackId: String? = null
+
+    private val _uiState: MutableStateFlow<PlayerUiState>
+    val uiState: StateFlow<PlayerUiState>
+
+    init {
+        val saved = storage?.load() ?: PersistedAppData()
+        persistedLastTrackId = saved.lastTrackId
+
+        val initialPlaylists = saved.playlists.ifEmpty {
+            listOf(
+                Playlist(id = "pl_fav_mix", name = "Mes favoris locaux"),
+                Playlist(id = "pl_chill", name = "Ambiance Nuit")
+            )
+        }
+        playlistCounter = initialPlaylists.size + 1
+
+        _uiState = MutableStateFlow(
+            PlayerUiState(
+                hasAudioPermission = initialPermissionGranted,
+                isDarkTheme = saved.isDarkTheme,
+                sortOrder = saved.sortOrder,
+                isShuffleEnabled = saved.isShuffleEnabled,
+                repeatMode = saved.repeatMode,
+                favoriteIds = saved.favoriteIds,
+                playlists = initialPlaylists
+            )
+        )
+        uiState = _uiState.asStateFlow()
+
+        audioController.setOnTrackCompletedListener {
+            scope.launch { onTrackCompleted() }
+        }
+        audioController.setOnTrackChangedListener { mediaId ->
+            scope.launch { onExternalTrackChanged(mediaId) }
+        }
+        audioController.setOnPlayingStateChangedListener { playing ->
+            scope.launch { _uiState.update { it.copy(isPlaying = playing) } }
+        }
+        audioController.setShuffleEnabled(saved.isShuffleEnabled)
+        audioController.setRepeatMode(saved.repeatMode)
+
+        startProgressLoop()
+        if (initialPermissionGranted) {
+            refreshLibrary()
+        }
+    }
 
     suspend fun loadArtworkBitmap(track: Track): ImageBitmap? {
         if (artworkCache.containsKey(track.id)) {
@@ -61,54 +115,55 @@ class MusicPlayerStateHolder(
         }
     }
 
-    private val _uiState = MutableStateFlow(
-        PlayerUiState(
-            hasAudioPermission = initialPermissionGranted,
-            isDarkTheme = true,
-            playlists = listOf(
-                Playlist(id = "pl_fav_mix", name = "Mes favoris locaux"),
-                Playlist(id = "pl_chill", name = "Ambiance Nuit")
+    private fun persistState() {
+        val st = _uiState.value
+        storage?.save(
+            PersistedAppData(
+                favoriteIds = st.favoriteIds,
+                playlists = st.playlists,
+                sortOrder = st.sortOrder,
+                isDarkTheme = st.isDarkTheme,
+                isShuffleEnabled = st.isShuffleEnabled,
+                repeatMode = st.repeatMode,
+                lastTrackId = st.currentTrack?.id ?: persistedLastTrackId
             )
         )
-    )
-    val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
-
-    init {
-        audioController.setOnTrackCompletedListener {
-            scope.launch {
-                onTrackCompleted()
-            }
-        }
-        audioController.setOnTrackChangedListener { mediaId ->
-            scope.launch {
-                onExternalTrackChanged(mediaId)
-            }
-        }
-        audioController.setOnPlayingStateChangedListener { playing ->
-            scope.launch {
-                _uiState.update { it.copy(isPlaying = playing) }
-            }
-        }
-        audioController.setRepeatMode(_uiState.value.repeatMode)
-        startProgressLoop()
-        if (initialPermissionGranted) {
-            refreshLibrary()
-        }
     }
 
     private fun onExternalTrackChanged(mediaId: String) {
         val state = _uiState.value
         val newIndex = state.queue.indexOfFirst { it.id == mediaId }
-        if (newIndex < 0) return
-        val target = state.queue[newIndex]
-        loadLyricsForCurrentTrack(target)
-        _uiState.update {
-            it.copy(
-                currentQueueIndex = newIndex,
-                positionMs = 0L,
-                durationMs = target.durationMs,
-                recentIds = (listOf(target.id) + it.recentIds.filterNot { id -> id == target.id }).take(30)
-            )
+        if (newIndex >= 0) {
+            val target = state.queue[newIndex]
+            loadLyricsForCurrentTrack(target)
+            _uiState.update {
+                it.copy(
+                    currentQueueIndex = newIndex,
+                    positionMs = 0L,
+                    durationMs = target.durationMs,
+                    recentIds = (listOf(target.id) + it.recentIds.filterNot { id -> id == target.id }).take(50)
+                )
+            }
+            persistState()
+        } else {
+            // Re-attached to a background service track before queue was rebuilt
+            val libIndex = state.allTracks.indexOfFirst { it.id == mediaId }
+            if (libIndex >= 0) {
+                val target = state.allTracks[libIndex]
+                originalQueue = state.allTracks
+                loadLyricsForCurrentTrack(target)
+                _uiState.update {
+                    it.copy(
+                        queue = state.allTracks,
+                        currentQueueIndex = libIndex,
+                        durationMs = target.durationMs,
+                        recentIds = (listOf(target.id) + it.recentIds.filterNot { id -> id == target.id }).take(50)
+                    )
+                }
+                persistState()
+            } else {
+                persistedLastTrackId = mediaId
+            }
         }
     }
 
@@ -126,17 +181,31 @@ class MusicPlayerStateHolder(
                 val tracks = scanner.scanLocalTracks()
                 _uiState.update { state ->
                     val updatedQueue = if (state.queue.isEmpty() && tracks.isNotEmpty()) {
-                        tracks
+                        originalQueue = tracks
+                        if (state.isShuffleEnabled) {
+                            SmartShuffleEngine.buildBalancedQueue(
+                                tracks = tracks,
+                                anchorTrackId = persistedLastTrackId,
+                                recentlyPlayedIds = state.recentIds
+                            )
+                        } else {
+                            tracks
+                        }
                     } else {
                         state.queue
                     }
+
                     val updatedIndex = if (state.currentQueueIndex == -1 && updatedQueue.isNotEmpty()) {
-                        0
+                        val restored = persistedLastTrackId?.let { id ->
+                            updatedQueue.indexOfFirst { it.id == id }
+                        } ?: -1
+                        if (restored >= 0) restored else 0
                     } else {
                         state.currentQueueIndex
                     }
+
                     val seededPlaylists = if (
-                        state.playlists.all { it.trackIds.isEmpty() } && tracks.size >= 2
+                        storage == null && state.playlists.all { it.trackIds.isEmpty() } && tracks.size >= 2
                     ) {
                         state.playlists.mapIndexed { idx, pl ->
                             val slice = if (idx == 0) tracks.take(4) else tracks.drop(2).take(4)
@@ -145,19 +214,14 @@ class MusicPlayerStateHolder(
                     } else {
                         state.playlists
                     }
-                    val seededFavorites = if (state.favoriteIds.isEmpty() && tracks.isNotEmpty()) {
-                        setOf(tracks.first().id)
-                    } else {
-                        state.favoriteIds
-                    }
+
                     state.copy(
                         allTracks = tracks,
                         isScanning = false,
                         queue = updatedQueue,
                         currentQueueIndex = updatedIndex,
                         durationMs = updatedQueue.getOrNull(updatedIndex)?.durationMs ?: state.durationMs,
-                        playlists = seededPlaylists,
-                        favoriteIds = seededFavorites
+                        playlists = seededPlaylists
                     )
                 }
             } finally {
@@ -172,14 +236,7 @@ class MusicPlayerStateHolder(
 
     fun setSortOrder(order: SortOrder) {
         _uiState.update { it.copy(sortOrder = order) }
-    }
-
-    fun cycleSortOrder() {
-        _uiState.update { state ->
-            val entries = SortOrder.entries
-            val next = entries[(entries.indexOf(state.sortOrder) + 1) % entries.size]
-            state.copy(sortOrder = next)
-        }
+        persistState()
     }
 
     fun openCollection(collection: QuickCollection?) {
@@ -201,6 +258,7 @@ class MusicPlayerStateHolder(
 
     fun toggleDarkTheme() {
         _uiState.update { it.copy(isDarkTheme = !it.isDarkTheme) }
+        persistState()
     }
 
     fun openNowPlaying(open: Boolean) {
@@ -218,24 +276,39 @@ class MusicPlayerStateHolder(
         openPlayer: Boolean = true
     ) {
         if (tracks.isEmpty()) return
-        val ordered = if (shuffle) tracks.shuffled() else tracks
-        val safeIndex = if (shuffle) 0 else startIndex.coerceIn(0, ordered.lastIndex)
-        val target = ordered[safeIndex]
+        val state = _uiState.value
+        val useShuffle = shuffle || state.isShuffleEnabled
+        originalQueue = tracks
 
+        val (ordered, safeIndex) = if (useShuffle) {
+            val anchorId = if (shuffle) null else tracks.getOrNull(startIndex)?.id
+            val balanced = SmartShuffleEngine.buildBalancedQueue(
+                tracks = tracks,
+                anchorTrackId = anchorId,
+                recentlyPlayedIds = state.recentIds
+            )
+            balanced to 0
+        } else {
+            tracks to startIndex.coerceIn(0, tracks.lastIndex)
+        }
+
+        val target = ordered[safeIndex]
         audioController.setQueueAndPlay(ordered, safeIndex)
         loadLyricsForCurrentTrack(target)
-        _uiState.update { state ->
-            state.copy(
+
+        _uiState.update { s ->
+            s.copy(
                 queue = ordered,
                 currentQueueIndex = safeIndex,
                 isPlaying = true,
-                isNowPlayingOpen = if (openPlayer) true else state.isNowPlayingOpen,
+                isNowPlayingOpen = if (openPlayer) true else s.isNowPlayingOpen,
                 positionMs = 0L,
                 durationMs = target.durationMs,
-                isShuffleEnabled = if (shuffle) true else state.isShuffleEnabled,
-                recentIds = (listOf(target.id) + state.recentIds.filterNot { it == target.id }).take(30)
+                isShuffleEnabled = useShuffle,
+                recentIds = (listOf(target.id) + s.recentIds.filterNot { it == target.id }).take(50)
             )
         }
+        persistState()
     }
 
     fun playFromQueue(index: Int) {
@@ -249,21 +322,25 @@ class MusicPlayerStateHolder(
                 isPlaying = true,
                 positionMs = 0L,
                 durationMs = track.durationMs,
-                recentIds = (listOf(track.id) + it.recentIds.filterNot { id -> id == track.id }).take(30)
+                recentIds = (listOf(track.id) + it.recentIds.filterNot { id -> id == track.id }).take(50)
             )
         }
+        persistState()
     }
 
     fun playNextInQueue(track: Track) {
-        _uiState.update { state ->
-            if (state.queue.isEmpty()) {
-                return@update state.copy(queue = listOf(track), currentQueueIndex = 0)
-            }
-            val insertIndex = (state.currentQueueIndex + 1).coerceIn(0, state.queue.size)
-            val mutable = state.queue.toMutableList()
-            mutable.add(insertIndex, track)
-            state.copy(queue = mutable)
+        val state = _uiState.value
+        if (state.queue.isEmpty()) {
+            originalQueue = listOf(track)
+            _uiState.update { it.copy(queue = listOf(track), currentQueueIndex = 0) }
+            return
         }
+        val insertIndex = (state.currentQueueIndex + 1).coerceIn(0, state.queue.size)
+        val mutable = state.queue.toMutableList()
+        mutable.add(insertIndex, track)
+        _uiState.update { it.copy(queue = mutable) }
+        // Live-sync into ExoPlayer / Dynamic Island without interrupting current audio!
+        audioController.updateQueueKeepingCurrent(mutable, state.currentQueueIndex)
     }
 
     fun removeFromQueue(index: Int) {
@@ -286,8 +363,12 @@ class MusicPlayerStateHolder(
             else -> state.currentQueueIndex
         }
         val currentChanged = index == state.currentQueueIndex
-        if (currentChanged && state.isPlaying) {
-            audioController.playTrack(mutable[newIndex])
+        if (currentChanged) {
+            if (state.isPlaying) {
+                audioController.setQueueAndPlay(mutable, newIndex)
+            }
+        } else {
+            audioController.updateQueueKeepingCurrent(mutable, newIndex)
         }
         _uiState.update {
             it.copy(
@@ -304,7 +385,7 @@ class MusicPlayerStateHolder(
         val current = state.currentTrack
         if (current == null) {
             if (state.allTracks.isNotEmpty()) {
-                playTracks(state.allTracks, 0)
+                playTracks(state.allTracks, 0, openPlayer = false)
             }
             return
         }
@@ -339,12 +420,33 @@ class MusicPlayerStateHolder(
         }
 
         val nextIndex = when {
-            state.isShuffleEnabled && state.queue.size > 1 -> {
-                val candidates = state.queue.indices.filter { it != state.currentQueueIndex }
-                candidates.random()
-            }
             state.currentQueueIndex < state.queue.lastIndex -> state.currentQueueIndex + 1
-            state.repeatMode == RepeatMode.ALL -> 0
+            state.repeatMode == RepeatMode.ALL -> {
+                // Re-shuffle fresh balanced cycle on wrap-around when Smart Shuffle is enabled!
+                if (state.isShuffleEnabled && state.queue.size > 2) {
+                    val freshCycle = SmartShuffleEngine.buildBalancedQueue(
+                        tracks = originalQueue.ifEmpty { state.queue },
+                        anchorTrackId = null,
+                        recentlyPlayedIds = state.recentIds
+                    )
+                    val first = freshCycle.first()
+                    audioController.setQueueAndPlay(freshCycle, 0)
+                    loadLyricsForCurrentTrack(first)
+                    _uiState.update {
+                        it.copy(
+                            queue = freshCycle,
+                            currentQueueIndex = 0,
+                            isPlaying = true,
+                            positionMs = 0L,
+                            durationMs = first.durationMs,
+                            recentIds = (listOf(first.id) + it.recentIds.filterNot { id -> id == first.id }).take(50)
+                        )
+                    }
+                    persistState()
+                    return
+                }
+                0
+            }
             else -> {
                 audioController.pause()
                 _uiState.update { it.copy(isPlaying = false, positionMs = 0L) }
@@ -375,9 +477,36 @@ class MusicPlayerStateHolder(
     }
 
     fun toggleShuffle() {
-        val next = !_uiState.value.isShuffleEnabled
-        audioController.setShuffleEnabled(next)
-        _uiState.update { it.copy(isShuffleEnabled = next) }
+        val state = _uiState.value
+        val enabling = !state.isShuffleEnabled
+        val current = state.currentTrack
+        val sourceList = originalQueue.ifEmpty { state.queue.ifEmpty { state.allTracks } }
+
+        val (newQueue, newIndex) = if (enabling) {
+            val balanced = SmartShuffleEngine.buildBalancedQueue(
+                tracks = sourceList,
+                anchorTrackId = current?.id,
+                recentlyPlayedIds = state.recentIds
+            )
+            balanced to 0
+        } else {
+            val restoredIdx = current?.let { c -> sourceList.indexOfFirst { it.id == c.id } } ?: 0
+            sourceList to restoredIdx.coerceAtLeast(0)
+        }
+
+        audioController.setShuffleEnabled(enabling)
+        if (newQueue.isNotEmpty() && current != null) {
+            audioController.updateQueueKeepingCurrent(newQueue, newIndex)
+        }
+
+        _uiState.update {
+            it.copy(
+                isShuffleEnabled = enabling,
+                queue = newQueue,
+                currentQueueIndex = if (newQueue.isEmpty()) -1 else newIndex
+            )
+        }
+        persistState()
     }
 
     fun cycleRepeatMode() {
@@ -388,6 +517,7 @@ class MusicPlayerStateHolder(
         }
         audioController.setRepeatMode(next)
         _uiState.update { it.copy(repeatMode = next) }
+        persistState()
     }
 
     fun toggleFavorite(trackId: String) {
@@ -399,6 +529,7 @@ class MusicPlayerStateHolder(
             }
             state.copy(favoriteIds = updated)
         }
+        persistState()
     }
 
     fun createPlaylist(name: String) {
@@ -408,6 +539,7 @@ class MusicPlayerStateHolder(
         _uiState.update { state ->
             state.copy(playlists = state.playlists + Playlist(id = id, name = trimmed))
         }
+        persistState()
     }
 
     fun deletePlaylist(playlistId: String) {
@@ -421,6 +553,7 @@ class MusicPlayerStateHolder(
                 activeCollection = updatedCollection
             )
         }
+        persistState()
     }
 
     fun addTrackToPlaylist(playlistId: String, trackId: String) {
@@ -435,6 +568,7 @@ class MusicPlayerStateHolder(
                 }
             )
         }
+        persistState()
     }
 
     private fun onTrackCompleted() {
@@ -471,6 +605,7 @@ class MusicPlayerStateHolder(
     }
 
     fun dispose() {
+        persistState()
         progressJob?.cancel()
         audioController.release()
         scope.cancel()

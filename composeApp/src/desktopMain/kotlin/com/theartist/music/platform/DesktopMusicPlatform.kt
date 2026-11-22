@@ -5,12 +5,16 @@ import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.platform.Font as DesktopFont
+import com.theartist.music.model.Playlist
+import com.theartist.music.model.RepeatMode
+import com.theartist.music.model.SortOrder
 import com.theartist.music.model.Track
 import com.theartist.music.model.accentColorForKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.jetbrains.skia.Image
 import java.io.File
+import java.util.Properties
 import javax.sound.sampled.AudioSystem
 import javax.sound.sampled.Clip
 
@@ -30,6 +34,71 @@ actual fun appFontFamily(): FontFamily = FontFamily(
 actual fun brandDisplayFontFamily(): FontFamily = FontFamily(
     DesktopFont("fonts/brand_display.ttf", FontWeight.Bold)
 )
+
+class DesktopPreferencesStorage : LocalPreferencesStorage {
+    private val configFile: File = File(
+        File(System.getProperty("user.home").orEmpty(), ".config/the-artist-music"),
+        "prefs.properties"
+    )
+
+    override fun load(): PersistedAppData {
+        if (!configFile.exists()) return PersistedAppData()
+        return runCatching {
+            val props = Properties()
+            configFile.inputStream().use { props.load(it) }
+            val favs = props.getProperty("favorites", "")
+                .split("\u001F").filter { it.isNotBlank() }.toSet()
+            val sortOrder = SortOrder.entries.firstOrNull {
+                it.name == props.getProperty("sortOrder")
+            } ?: SortOrder.DATE_ADDED_DESC
+            val repeatMode = RepeatMode.entries.firstOrNull {
+                it.name == props.getProperty("repeatMode")
+            } ?: RepeatMode.ALL
+            val isDark = props.getProperty("isDark", "true").toBoolean()
+            val isShuffle = props.getProperty("isShuffle", "false").toBoolean()
+            val lastTrackId = props.getProperty("lastTrackId", "").ifBlank { null }
+
+            val playlistsCount = props.getProperty("playlists.count", "0").toIntOrNull() ?: 0
+            val playlists = (0 until playlistsCount).mapNotNull { i ->
+                val id = props.getProperty("pl.$i.id").orEmpty()
+                val name = props.getProperty("pl.$i.name").orEmpty()
+                if (id.isBlank() || name.isBlank()) return@mapNotNull null
+                val ids = props.getProperty("pl.$i.tracks", "")
+                    .split("\u001F").filter { it.isNotBlank() }
+                Playlist(id = id, name = name, trackIds = ids)
+            }
+            PersistedAppData(
+                favoriteIds = favs,
+                playlists = playlists,
+                sortOrder = sortOrder,
+                isDarkTheme = isDark,
+                isShuffleEnabled = isShuffle,
+                repeatMode = repeatMode,
+                lastTrackId = lastTrackId
+            )
+        }.getOrDefault(PersistedAppData())
+    }
+
+    override fun save(data: PersistedAppData) {
+        runCatching {
+            configFile.parentFile?.mkdirs()
+            val props = Properties()
+            props.setProperty("favorites", data.favoriteIds.joinToString("\u001F"))
+            props.setProperty("sortOrder", data.sortOrder.name)
+            props.setProperty("repeatMode", data.repeatMode.name)
+            props.setProperty("isDark", data.isDarkTheme.toString())
+            props.setProperty("isShuffle", data.isShuffleEnabled.toString())
+            props.setProperty("lastTrackId", data.lastTrackId.orEmpty())
+            props.setProperty("playlists.count", data.playlists.size.toString())
+            data.playlists.forEachIndexed { i, pl ->
+                props.setProperty("pl.$i.id", pl.id)
+                props.setProperty("pl.$i.name", pl.name)
+                props.setProperty("pl.$i.tracks", pl.trackIds.joinToString("\u001F"))
+            }
+            configFile.outputStream().use { props.store(it, "The @rtist Music Preferences") }
+        }
+    }
+}
 
 class DesktopAudioPlayerController : AudioPlayerController {
     private var clip: Clip? = null

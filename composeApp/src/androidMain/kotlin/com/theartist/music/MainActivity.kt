@@ -18,6 +18,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import com.theartist.music.platform.AndroidAudioPlayerController
 import com.theartist.music.platform.AndroidLocalMusicScanner
+import com.theartist.music.platform.AndroidPreferencesStorage
 import com.theartist.music.state.MusicPlayerStateHolder
 
 class MainActivity : ComponentActivity() {
@@ -67,6 +68,7 @@ class MainActivity : ComponentActivity() {
         stateHolder = MusicPlayerStateHolder(
             scanner = scanner,
             audioController = AndroidAudioPlayerController(applicationContext, scanner),
+            storage = AndroidPreferencesStorage(applicationContext),
             initialPermissionGranted = hasAudioPermission
         )
 

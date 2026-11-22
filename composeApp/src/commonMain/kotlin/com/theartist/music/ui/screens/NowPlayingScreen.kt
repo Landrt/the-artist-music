@@ -54,10 +54,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -103,6 +105,14 @@ fun NowPlayingScreen(
     var showLyrics by remember { mutableStateOf(false) }
     var showMoreSheet by remember { mutableStateOf(false) }
     var showInfoSheet by remember { mutableStateOf(false) }
+    var modeToast by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(modeToast) {
+        if (modeToast != null) {
+            delay(1600L)
+            modeToast = null
+        }
+    }
 
     val rawAccent by animateColorAsState(
         targetValue = Color(track.accentColorHex),
@@ -407,7 +417,27 @@ fun NowPlayingScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(26.dp))
+            // Optional crisp feedback pill when toggling Smart Shuffle / Repeat
+            Box(
+                modifier = Modifier.height(26.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                val msg = modeToast
+                if (msg != null) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.Black.copy(alpha = 0.45f))
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = msg,
+                            fontSize = 11.5.sp,
+                            color = Color.White.copy(alpha = 0.92f)
+                        )
+                    }
+                }
+            }
 
             // 5. Custom Ultra-Thin White Seekbar (2dp line + 12dp white dot) + 00:10 / 03:19
             val duration = uiState.durationMs.coerceAtLeast(1L)
@@ -446,7 +476,7 @@ fun NowPlayingScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Shuffle / Repeat mode
+                // Smart Shuffle / Repeat All / Repeat One cycle
                 Box(
                     modifier = Modifier
                         .size(32.dp)
@@ -454,13 +484,27 @@ fun NowPlayingScreen(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) {
-                            if (uiState.isShuffleEnabled) {
-                                onToggleShuffle()
-                            } else if (uiState.repeatMode == RepeatMode.ONE) {
-                                onCycleRepeat()
-                                onToggleShuffle()
-                            } else {
-                                onCycleRepeat()
+                            when {
+                                !uiState.isShuffleEnabled && uiState.repeatMode == RepeatMode.ALL -> {
+                                    onToggleShuffle()
+                                    modeToast = "Aléatoire intelligent activé"
+                                }
+                                uiState.isShuffleEnabled -> {
+                                    onToggleShuffle()
+                                    if (uiState.repeatMode != RepeatMode.ONE) {
+                                        onCycleRepeat()
+                                    }
+                                    modeToast = "Répéter ce morceau"
+                                }
+                                uiState.repeatMode == RepeatMode.ONE -> {
+                                    onCycleRepeat() // -> OFF
+                                    onCycleRepeat() // -> ALL
+                                    modeToast = "Répéter toute la liste"
+                                }
+                                else -> {
+                                    onToggleShuffle()
+                                    modeToast = "Aléatoire intelligent activé"
+                                }
                             }
                         },
                     contentAlignment = Alignment.CenterStart
@@ -470,10 +514,15 @@ fun NowPlayingScreen(
                         uiState.repeatMode == RepeatMode.ONE -> Icons.Rounded.RepeatOne
                         else -> Icons.Rounded.Repeat
                     }
+                    val modeTint = if (uiState.isShuffleEnabled || uiState.repeatMode == RepeatMode.ONE) {
+                        ArtistCrimson
+                    } else {
+                        Color.White.copy(alpha = 0.78f)
+                    }
                     Icon(
                         imageVector = modeIcon,
                         contentDescription = "Mode lecture",
-                        tint = Color.White.copy(alpha = 0.78f),
+                        tint = modeTint,
                         modifier = Modifier.size(22.dp)
                     )
                 }

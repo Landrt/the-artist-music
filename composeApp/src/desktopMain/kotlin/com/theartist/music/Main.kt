@@ -11,6 +11,7 @@ import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import com.theartist.music.platform.DesktopAudioPlayerController
 import com.theartist.music.platform.DesktopLocalMusicScanner
+import com.theartist.music.platform.DesktopPreferencesStorage
 import com.theartist.music.state.MusicPlayerStateHolder
 
 fun main() = application {
@@ -28,6 +29,7 @@ fun main() = application {
             MusicPlayerStateHolder(
                 scanner = DesktopLocalMusicScanner(),
                 audioController = DesktopAudioPlayerController(),
+                storage = DesktopPreferencesStorage(),
                 initialPermissionGranted = true
             )
         }

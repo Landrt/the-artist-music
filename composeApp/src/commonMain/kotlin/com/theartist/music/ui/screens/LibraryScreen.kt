@@ -1335,16 +1335,23 @@ private fun resolveCollectionTracks(
     uiState: PlayerUiState
 ): List<Track> {
     val byId = uiState.allTracks.associateBy { it.id }
-    return when (collection) {
+    val raw = when (collection) {
         QuickCollection.Favorites -> uiState.allTracks.filter { it.id in uiState.favoriteIds }
-        QuickCollection.Recent -> uiState.recentIds.mapNotNull { byId[it] }
+        QuickCollection.Recent -> return uiState.recentIds.mapNotNull { byId[it] }
         QuickCollection.PlaylistsOverview -> emptyList()
         is QuickCollection.AlbumDetail -> uiState.allTracks.filter { it.album == collection.albumName }
         is QuickCollection.ArtistDetail -> uiState.allTracks.filter { it.artist == collection.artistName }
         is QuickCollection.FolderDetail -> uiState.allTracks.filter { it.folderName == collection.folderName }
         is QuickCollection.PlaylistDetail -> {
             val pl = uiState.playlists.firstOrNull { it.id == collection.playlistId }
-            pl?.trackIds?.mapNotNull { byId[it] }.orEmpty()
+            return pl?.trackIds?.mapNotNull { byId[it] }.orEmpty()
         }
+    }
+    return when (uiState.sortOrder) {
+        SortOrder.DATE_ADDED_DESC -> raw.sortedByDescending { it.dateAddedSec }
+        SortOrder.TITLE_ASC -> raw.sortedBy { it.title.lowercase() }
+        SortOrder.TITLE_DESC -> raw.sortedByDescending { it.title.lowercase() }
+        SortOrder.ARTIST_ASC -> raw.sortedBy { it.artist.lowercase() }
+        SortOrder.DURATION_DESC -> raw.sortedByDescending { it.durationMs }
     }
 }
